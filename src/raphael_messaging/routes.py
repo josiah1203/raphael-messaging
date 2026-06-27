@@ -1,48 +1,108 @@
-"""API routes for raphael-messaging."""
+"""API routes for raphael-messaging — Twilio Conversations with local fallback."""
 
 from __future__ import annotations
 
-import os
-import sqlite3
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+
+from raphael_messaging.events import handle_bus_event
+from raphael_messaging.store import ConversationsStore
+from raphael_messaging.twilio_conversations import TwilioConversationsClient
 
 router = APIRouter(tags=["raphael-messaging"])
-_db = Path(os.environ.get("RAPHAEL_MESSAGING_DB", "/tmp/raphael-messaging.db"))
-_conn = sqlite3.connect(_db, check_same_thread=False)
-_conn.execute(
-    """CREATE TABLE IF NOT EXISTS items (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        body TEXT,
-        created_at TEXT NOT NULL
-    )"""
-)
-_conn.commit()
-_items: list[dict[str, Any]] = []
+_store = ConversationsStore()
+_twilio = TwilioConversationsClient()
 
 
 @router.get("")
-def list_items() -> dict[str, Any]:
-    rows = _conn.execute("SELECT id, name, body, created_at FROM items ORDER BY created_at DESC").fetchall()
-    return {"service": "raphael-messaging", "items": [{"id": r[0], "name": r[1], "body": r[2], "created_at": r[3]} for r in rows]}
+def list_conversations(workspace_id: str | None = None) -> dict[str, Any]:
+    return {
+        "service": "raphael-messaging",
+        "twilio_configured": _twilio.enabled,
+        "conversations": _store.list_conversations(workspace_id),
+    }
 
 
 @router.post("")
-def create_item(body: dict[str, Any]) -> dict[str, Any]:
-    iid = body.get("id", f"item-{int(datetime.now(timezone.utc).timestamp())}")
-    now = datetime.now(timezone.utc).isoformat()
-    _conn.execute("INSERT INTO items (id, name, body, created_at) VALUES (?, ?, ?, ?)", (iid, body.get("name", iid), body.get("body", ""), now))
-    _conn.commit()
-    return {"id": iid, "name": body.get("name", iid), "created_at": now}
+def create_conversation(body: dict[str, Any]) -> dict[str, Any]:
+    workspace_id = body.get("workspace_id", "default")
+    target_type = body.get("target_type")
+    target_id = body.get("target_id")
+    friendly_name = body.get("name") or f"{target_type}/{target_id}"
+
+    twilio_sid = None
+    if _twilio.enabled:
+        result = _twilio.create_conversation(friendly_name)
+        if result.get("status") == "created":
+            twilio_sid = result["sid"]
+
+    return _store.create_conversation(
+        workspace_id,
+        target_type,
+        target_id,
+        twilio_sid,
+        name=friendly_name,
+    )
 
 
-@router.get("/{item_id}")
-def get_item(item_id: str) -> dict[str, Any]:
-    row = _conn.execute("SELECT id, name, body, created_at FROM items WHERE id = ?", (item_id,)).fetchone()
-    if not row:
+@router.post("/events")
+def consume_event(body: dict[str, Any]) -> dict[str, str]:
+    """HTTP hook for dev without Kafka."""
+    handle_bus_event(body)
+    return {"status": "processed"}
+
+
+@router.post("/webhooks/twilio")
+async def twilio_webhook(request: Request) -> dict[str, str]:
+    """Inbound Twilio Conversations webhook — stores message in local DB."""
+    form = await request.form()
+    conversation_sid = str(form.get("ConversationSid", ""))
+    body = str(form.get("Body", ""))
+    author = str(form.get("Author", "unknown"))
+    message_sid = str(form.get("MessageSid", ""))
+
+    if not conversation_sid or not body:
+        return {"status": "ignored"}
+
+    conversation = _store.find_by_twilio_sid(conversation_sid)
+    if conversation:
+        _store.add_message(
+            conversation["id"],
+            body,
+            author=author,
+            twilio_message_sid=message_sid or None,
+            data={"source": "twilio_webhook"},
+        )
+    return {"status": "processed"}
+
+
+@router.get("/{conversation_id}/messages")
+def list_messages(conversation_id: str) -> dict[str, Any]:
+    conversation = _store.get_conversation(conversation_id)
+    if not conversation:
         raise HTTPException(404, detail="not_found")
-    return {"id": row[0], "name": row[1], "body": row[2], "created_at": row[3]}
+    messages = _store.list_messages(conversation_id)
+    if _twilio.enabled and conversation.get("twilio_conversation_sid") and not messages:
+        remote = _twilio.list_messages(conversation["twilio_conversation_sid"])
+        return {"conversation_id": conversation_id, "messages": messages, "twilio_messages": remote}
+    return {"conversation_id": conversation_id, "messages": messages}
+
+
+@router.post("/{conversation_id}/messages")
+def send_message(conversation_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    conversation = _store.get_conversation(conversation_id)
+    if not conversation:
+        raise HTTPException(404, detail="not_found")
+    text = (body.get("body") or "").strip()
+    if not text:
+        raise HTTPException(400, detail="body_required")
+    author = body.get("author", "user")
+
+    twilio_sid = None
+    if _twilio.enabled and conversation.get("twilio_conversation_sid"):
+        result = _twilio.send_message(conversation["twilio_conversation_sid"], text, author=author)
+        if result.get("status") == "sent":
+            twilio_sid = result["sid"]
+
+    return _store.add_message(conversation_id, text, author=author, twilio_message_sid=twilio_sid)
